@@ -1,10 +1,11 @@
 var express = require('express')
   , app = express()
   , _ = require('underscore')
-  , authbox = require('authbox')
+  , carriers = require('../lib/carriers.js')
   , crypto = require('crypto')
   , exec = require('child_process').exec
   , fs = require('fs')
+  , path = require('path')
   , mixpanel = require('mixpanel')
   , redis = require('redis-url').connect()
   , spawn = require('child_process').spawn
@@ -18,6 +19,12 @@ app.use(express.cookieParser());
 app.use(express.static(__dirname + '/public'));
 app.use(express.json());
 app.use(express.urlencoded());
+app.use(function(req, res, next) {
+  // Enable CORS so sites can use the API directly in JS.
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+  next();
+});
 
 // Enable log messages when sending texts.
 text.debug(true);
@@ -30,22 +37,28 @@ try {
   banned_numbers = {BLACKLIST: {}};
 }
 
+var banned_ips = {};
+try {
+  var banned_list = fs.readFileSync(path.join(__dirname, './torlist')).toString('utf-8').split('\n');
+  banned_list.map(function(ip) {
+    ip = ip.trim();
+    if (ip != '') {
+      banned_ips[ip] = true;
+    }
+  });
+  console.log(banned_list.length, 'banned ips loaded');
+} catch(e) {
+  console.log(e);
+}
+
+
 var mpq
-  , mixpanel_config
-  , authbox_config;
+  , mixpanel_config;
 try {
   mixpanel_config = require('./mixpanel_config.js');
   mpq = new mixpanel.Client(mixpanel_config.api_key);
 } catch(e) {
   mpq = {track: function() {}};
-}
-
-try {
-  authbox_config = require('./authbox_config.js');
-  authbox.configure(authbox_config);
-  app.use(authbox.middleware);
-} catch(e) {
-  authbox = {log: function() {}};
 }
 
 var access_keys;
@@ -71,40 +84,49 @@ app.get('/providers/:region', function(req, res) {
 });
 
 app.post('/text', function(req, res) {
+  if (req.body.getcarriers != null && (req.body.getcarriers == 1 || req.body.getcarriers.toLowerCase() == 'true')) {
+    res.send({success:true, carriers:Object.keys(carriers).sort()});
+    return;
+  }
   var number = stripPhone(req.body.number);
   if (number.length < 9 || number.length > 10) {
     res.send({success:false, message:'Invalid phone number.'});
     return;
   }
-  textRequestHandler(req, res, number, 'us', req.query.key);
+  textRequestHandler(req, res, number, req.body.carrier, 'us', req.query.key);
 });
 
 app.post('/canada', function(req, res) {
-  textRequestHandler(req, res, stripPhone(req.body.number), 'canada', req.query.key);
+  textRequestHandler(req, res, stripPhone(req.body.number), req.body.carrier, 'canada', req.query.key);
 });
 
 app.post('/intl', function(req, res) {
-  textRequestHandler(req, res, stripPhone(req.body.number), 'intl', req.query.key);
+  textRequestHandler(req, res, stripPhone(req.body.number), req.body.carrier, 'intl', req.query.key);
 });
 
 // App helper functions
 
-function textRequestHandler(req, res, number, region, key) {
+function textRequestHandler(req, res, number, carrier, region, key) {
   var ip = req.connection.remoteAddress;
   if (!ip || ip === '127.0.0.1') {
     ip = req.header('X-Real-IP');
   }
-
-  var authbox_details = {
-    $actionName: 'text',
-    $ipAddress: ip
-  };
+  if (req.header('CF-Connecting-IP')) {
+    ip = req.header('CF-Connecting-IP');
+  }
 
   if (!number || !req.body.message) {
-    mpq.track('incomplete request');
-    authbox.log(req, _.extend(authbox_details, {$failureReason: 'incomplete_request'}));
+    mpq.track('incomplete request', {ip: ip, ip2: ip});
     res.send({success:false, message:'Number and message parameters are required.'});
     return;
+  }
+  if (carrier != null) {
+    carrier = carrier.toLowerCase();
+    if (carriers[carrier] == null) {
+      res.send({succes:false, message:'Carrier ' + carrier + ' not supported! POST getcarriers=1 to '
+                                                               + 'get a list of supported carriers'});
+      return;
+    }
   }
 
   var message = req.body.message;
@@ -113,36 +135,37 @@ function textRequestHandler(req, res, number, region, key) {
     // contains a colon.
     message = ' ' + message;
   }
+  if (ip in banned_ips) {
+    // Shadowban tor ips
+    setTimeout(function() {
+      res.send({success:false});
+    }, 1000);
+    return;
+  }
 
   var shasum = crypto.createHash('sha1');
   shasum.update(number);
-  var authbox_digest = shasum.digest('hex');
-  _.extend(authbox_details, {
-    recipient: authbox_digest,
-    message__text: message
-  });
-
-  if (banned_numbers.BLACKLIST[number]) {
-    mpq.track('banned number');
-    authbox.log(req, _.extend(authbox_details, {$failureReason: 'banned_number'}));
-    res.send({success:false,message:'Sorry, texts to this number are disabled.'});
-    return;
-  }
 
   var tracking_details = {
     number: number,
     message: req.body.message,
-    ip: ip
+    ip: ip,
+    ip2: ip
   };
+
+  if (banned_numbers.BLACKLIST[number]) {
+    mpq.track('banned number', tracking_details);
+    res.send({success:false,message:'Sorry, texts to this number are disabled.'});
+    return;
+  }
 
   var doSendText = function(response_obj) {
     response_obj = response_obj || {};
 
     // Time to actually send the message
-    text.send(number, message, region, function(err) {
+    text.send(number, message, carrier, region, function(err) {
       if (err) {
         mpq.track('sendText failed', tracking_details);
-        authbox.log(req, _.extend(authbox_details, {$failureReason: 'gateway_failed'}));
         res.send(_.extend(response_obj,
                           {
                             success:false,
@@ -151,7 +174,6 @@ function textRequestHandler(req, res, number, region, key) {
       }
       else {
         mpq.track('sendText success', tracking_details);
-        authbox.log(req, _.extend(authbox_details, {$success: true}));
         res.send(_.extend(response_obj, {success:true}));
       }
     });
@@ -188,8 +210,7 @@ function textRequestHandler(req, res, number, region, key) {
       });
     }, 1000*60*3);
     if (num > 3) {
-      mpq.track('exceeded phone quota');
-      authbox.log(req, _.extend(authbox_details, {$failureReason: 'exceeded_phone_quota'}));
+      //mpq.track('exceeded phone quota', tracking_details);
       res.send({success:false, message:'Exceeded quota for this phone number. ' + number});
       return;
     }
@@ -202,8 +223,7 @@ function textRequestHandler(req, res, number, region, key) {
         return;
       }
       if (num > 75) {
-        mpq.track('exceeded ip quota');
-        authbox.log(req, _.extend(authbox_details, {$failureReason: 'exceeded_ip_quota'}));
+        mpq.track('exceeded ip quota', tracking_details);
         res.send({success:false, message:'Exceeded quota for this IP address. ' + ip});
         return;
       }
